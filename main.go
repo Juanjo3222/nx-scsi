@@ -15,11 +15,17 @@
 package main
 
 import (
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -31,6 +37,70 @@ import (
 )
 
 const dataDir = "/data/scsi"
+
+// jwtPublicKey is the RSA public key used to verify JWT tokens from nx-dauth.
+// Set via JWT_PUBLIC_KEY (PEM inline) or JWT_PUBLIC_KEY_PATH (file path).
+// When neither is set, verification is skipped and a warning is logged at startup.
+var jwtPublicKey *rsa.PublicKey
+
+func init() {
+	keyPEM := os.Getenv("JWT_PUBLIC_KEY")
+	if keyPEM == "" {
+		if p := os.Getenv("JWT_PUBLIC_KEY_PATH"); p != "" {
+			if b, err := os.ReadFile(p); err == nil {
+				keyPEM = string(b)
+			} else {
+				log.Printf("[scsi] WARNING: JWT_PUBLIC_KEY_PATH=%s: %v — JWT verification disabled", p, err)
+			}
+		}
+	}
+	if keyPEM != "" {
+		block, _ := pem.Decode([]byte(keyPEM))
+		if block == nil {
+			log.Printf("[scsi] WARNING: JWT_PUBLIC_KEY: no PEM block found — JWT verification disabled")
+		} else if key, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+			if rk, ok := key.(*rsa.PublicKey); ok {
+				jwtPublicKey = rk
+				log.Printf("[scsi] JWT verification enabled with RSA public key")
+			} else {
+				log.Printf("[scsi] WARNING: JWT_PUBLIC_KEY is not RSA — JWT verification disabled")
+			}
+		} else {
+			log.Printf("[scsi] WARNING: JWT_PUBLIC_KEY: %v — JWT verification disabled", err)
+		}
+	} else {
+		log.Printf("[scsi] WARNING: neither JWT_PUBLIC_KEY nor JWT_PUBLIC_KEY_PATH set — JWT signature verification DISABLED")
+	}
+}
+
+// verifyJWT verifies the RS256 signature of a JWT and returns its claims.
+func verifyJWT(token string) (map[string]any, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid JWT format: %d parts", len(parts))
+	}
+
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid JWT signature encoding: %v", err)
+	}
+
+	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(jwtPublicKey, crypto.SHA256, hash[:], sig); err != nil {
+		return nil, fmt.Errorf("JWT signature verification failed: %v", err)
+	}
+
+	pb, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, err
+	}
+
+	var claims map[string]any
+	if err := json.Unmarshal(pb, &claims); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
 
 // ---------------------------------------------------------------------------
 // Modèle (JSON fidèle à la trace)
@@ -177,25 +247,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// nsaId extrait du Bearer (sub du JWT) ; fallback sur un défaut si absent.
+// nsaId extrait du Bearer (sub du JWT vérifié) ; fallback sur vide si le token est absent
+// ou invalide. Quand jwtPublicKey est configuré, la signature RS256 est vérifiée — un token
+// forgé ou altéré renvoie "" (l'appelant reçoit une réponse vide/404, pas un accès indu).
 func nsaFromToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
-	if i := strings.Index(auth, "."); i >= 0 && strings.HasPrefix(auth, "Bearer ") {
-		parts := strings.Split(strings.TrimPrefix(auth, "Bearer "), ".")
-		if len(parts) >= 2 {
-			if pb, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
-				var claims map[string]any
-				if json.Unmarshal(pb, &claims) == nil {
-					// [Sécurité] Ne renvoyer le sub que s'il est un identifiant sûr : il sert de
-					// composant de chemin (dossier des saves). Un sub piégé ("../…") est ignoré
-					// -> l'appelant retombe sur l'identité précédente/vide, jamais sur un chemin
-					// d'évasion. (La signature du token n'est PAS vérifiée ici — cf. note isolation.)
-					if sub, ok := claims["sub"].(string); ok && safeIDComponent(sub) {
-						return sub
-					}
-				}
-			}
-		}
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	token := strings.TrimPrefix(auth, "Bearer ")
+
+	claims, err := verifyJWT(token)
+	if err != nil {
+		log.Printf("[scsi] JWT verification FAILED from %s: %v", r.RemoteAddr, err)
+		return ""
+	}
+
+	if sub, ok := claims["sub"].(string); ok && safeIDComponent(sub) {
+		return sub
 	}
 	return ""
 }
